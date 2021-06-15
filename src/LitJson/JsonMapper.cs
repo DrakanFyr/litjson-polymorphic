@@ -14,11 +14,37 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 
 
 namespace LitJson
 {
+    internal struct TypeMetadata
+    {
+        private Type type;
+        private string type_id;
+        
+        private IDictionary<string, TypeMetadata> sub_types_map;
+
+        public Type Type
+        {
+            get { return type; }
+            set { type = value; }
+        }
+
+        public string TypeId
+        {
+            get { return type_id; }
+            set { type_id = value; }
+        }
+
+        public IDictionary<string, TypeMetadata> SubtypesMap {
+            get { return sub_types_map; }
+            set { sub_types_map = value; }
+        }
+    }
+    
     internal struct PropertyMetadata
     {
         public MemberInfo Info;
@@ -126,6 +152,9 @@ namespace LitJson
                 IList<PropertyMetadata>> type_properties;
         private static readonly object type_properties_lock = new Object ();
 
+        private static readonly IDictionary<Type, TypeMetadata> type_metadata;
+        private static readonly object type_metadata_lock = new Object ();
+
         private static readonly JsonWriter      static_writer;
         private static readonly object static_writer_lock = new Object ();
         #endregion
@@ -141,6 +170,7 @@ namespace LitJson
             object_metadata = new Dictionary<Type, ObjectMetadata> ();
             type_properties = new Dictionary<Type,
                             IList<PropertyMetadata>> ();
+            type_metadata = new Dictionary<Type, TypeMetadata>();
 
             static_writer = new JsonWriter ();
 
@@ -279,6 +309,91 @@ namespace LitJson
             }
         }
 
+        private static void AddTypeMetadata(Type type)
+        {
+            if (type_metadata.ContainsKey(type))
+                return;
+            
+            TypeMetadata metadata = new TypeMetadata();
+            metadata.SubtypesMap = new Dictionary<string, TypeMetadata>();
+
+            metadata.Type = type;
+
+            Type subtype_map_owner = GetSubtypeMapOwner(type);
+
+            if (subtype_map_owner != null)
+            {
+                Attribute[] custom_attrs = Attribute.GetCustomAttributes(subtype_map_owner);
+
+                foreach (Attribute attribute in custom_attrs)
+                {
+                    SubtypeAttribute subtype_attr = attribute as SubtypeAttribute;
+                    
+                    if (subtype_attr == null)
+                        continue;
+
+                    if (subtype_attr.Subtype == type)
+                    {
+                        metadata.TypeId = subtype_attr.SubtypeId;
+                        
+                        metadata.SubtypesMap.Add(subtype_attr.SubtypeId, metadata);
+                        
+                        continue;
+                    }
+
+                    TypeMetadata subtype_metadata;
+
+                    if (type_metadata.ContainsKey(subtype_attr.Subtype))
+                    {
+                        subtype_metadata = type_metadata[subtype_attr.Subtype];
+                    }
+                    else
+                    {
+                        subtype_metadata = new TypeMetadata();
+                        subtype_metadata.SubtypesMap = new Dictionary<string, TypeMetadata>();
+
+                        subtype_metadata.Type = subtype_attr.Subtype;
+                        subtype_metadata.TypeId = subtype_attr.SubtypeId;
+
+                        lock (type_metadata_lock) {
+                            try {
+                                type_metadata.Add (subtype_metadata.Type, subtype_metadata);
+                            } catch (ArgumentException) {
+                                return;
+                            }
+                        }    
+                    }
+                    
+                    metadata.SubtypesMap.Add(subtype_attr.SubtypeId, subtype_metadata);
+                }   
+            }
+
+            lock (type_metadata_lock) {
+                try {
+                    type_metadata.Add (metadata.Type, metadata);
+                } catch (ArgumentException) {
+                    return;
+                }
+            }
+        }
+        
+        private static Type GetSubtypeMapOwner(Type obj_type)
+        {
+            Attribute[] baseTypeAttributes = Attribute.GetCustomAttributes(obj_type);
+
+            foreach (Attribute baseTypeAttribute in baseTypeAttributes)
+            {
+                SubtypeMapAttribute typeMapRegister = baseTypeAttribute as SubtypeMapAttribute;
+
+                if (typeMapRegister != null)
+                {
+                    return typeMapRegister.SubtypeMap;
+                }
+            }
+
+            return null;
+        }
+
         private static MethodInfo GetConvOp (Type t1, Type t2)
         {
             lock (conv_ops_lock) {
@@ -410,10 +525,10 @@ namespace LitJson
 
                 while (true) {
                     object item = ReadValue (elem_type, reader);
-                    if (item == null && reader.Token == JsonToken.ArrayEnd)
-                        break;
+                        if (item == null && reader.Token == JsonToken.ArrayEnd)
+                            break;
 
-                    list.Add (item);
+                        list.Add (item);
                 }
 
                 if (t_data.IsArray) {
@@ -425,64 +540,231 @@ namespace LitJson
                 } else
                     instance = list;
 
-            } else if (reader.Token == JsonToken.ObjectStart) {
-                AddObjectMetadata (value_type);
-                ObjectMetadata t_data = object_metadata[value_type];
+            }
+            else if (reader.Token == JsonToken.ObjectStart) {
+                AddTypeMetadata (value_type);
+                TypeMetadata value_type_meta_data = type_metadata[value_type];
+                
+                if (value_type_meta_data.SubtypesMap.Count > 0)
+                {
+                    JsonData value_data = new JsonData();
+                    value_data.SetJsonType(JsonType.Object);
 
-                instance = Activator.CreateInstance (value_type);
+                    while (true)
+                    {
+                        reader.Read();
 
-                while (true) {
-                    reader.Read ();
+                        if (reader.Token == JsonToken.ObjectEnd)
+                            break;
 
-                    if (reader.Token == JsonToken.ObjectEnd)
-                        break;
+                        string property = (string) reader.Value;
 
-                    string property = (string) reader.Value;
-
-                    if (t_data.Properties.ContainsKey (property)) {
-                        PropertyMetadata prop_data =
-                            t_data.Properties[property];
-
-                        if (prop_data.IsField) {
-                            ((FieldInfo) prop_data.Info).SetValue (
-                                instance, ReadValue (prop_data.Type, reader));
-                        } else {
-                            PropertyInfo p_info =
-                                (PropertyInfo) prop_data.Info;
-
-                            if (p_info.CanWrite)
-                                p_info.SetValue (
-                                    instance,
-                                    ReadValue (prop_data.Type, reader),
-                                    null);
-                            else
-                                ReadValue (prop_data.Type, reader);
-                        }
-
-                    } else {
-                        if (! t_data.IsDictionary) {
-
-                            if (! reader.SkipNonMembers) {
-                                throw new JsonException (String.Format (
-                                        "The type {0} doesn't have the " +
-                                        "property '{1}'",
-                                        inst_type, property));
-                            } else {
-                                ReadSkip (reader);
-                                continue;
-                            }
-                        }
-
-                        ((IDictionary) instance).Add (
-                            property, ReadValue (
-                                t_data.ElementType, reader));
+                        value_data[property] = (JsonData) ToWrapper (
+                            delegate { return new JsonData (); }, reader);
                     }
 
+                    instance = GetObjectFromJsonData(value_type, value_data);
                 }
+                else
+                {
+                    AddObjectMetadata (value_type);
+                    ObjectMetadata t_data = object_metadata[value_type];
 
+                    instance = Activator.CreateInstance (value_type);
+
+                    while (true) {
+                        reader.Read ();
+
+                        if (reader.Token == JsonToken.ObjectEnd)
+                            break;
+
+                        string property = (string) reader.Value;
+
+                        if (t_data.Properties.ContainsKey (property)) {
+                            PropertyMetadata prop_data =
+                                t_data.Properties[property];
+
+                            if (prop_data.IsField) {
+                                ((FieldInfo) prop_data.Info).SetValue (
+                                    instance, ReadValue (prop_data.Type, reader));
+                            } else {
+                                PropertyInfo p_info =
+                                    (PropertyInfo) prop_data.Info;
+
+                                if (p_info.CanWrite)
+                                    p_info.SetValue (
+                                        instance,
+                                        ReadValue (prop_data.Type, reader),
+                                        null);
+                                else
+                                    ReadValue (prop_data.Type, reader);
+                            }
+
+                        } else {
+                            if (! t_data.IsDictionary) {
+
+                                if (! reader.SkipNonMembers) {
+                                    throw new JsonException (String.Format (
+                                            "The type {0} doesn't have the " +
+                                            "property '{1}'",
+                                            inst_type, property));
+                                } else {
+                                    ReadSkip (reader);
+                                    continue;
+                                }
+                            }
+
+                            ((IDictionary) instance).Add (
+                                property, ReadValue (
+                                    t_data.ElementType, reader));
+                        }
+
+                    }   
+                }
             }
 
             return instance;
+        }
+
+        private static object GetObjectFromJsonData(Type objectType, JsonData objectJsonData)
+        {
+            // Handle the primitive types
+            if (objectType == typeof(Boolean))
+            {
+                return (Boolean)objectJsonData;
+            }
+            if (objectType == typeof(Double))
+            {
+                return (Double)objectJsonData;
+            }
+            if (objectType == typeof(Int32))
+            {
+                return (Int32)objectJsonData;
+            }
+            if (objectType == typeof(Int64))
+            {
+                return (Int64)objectJsonData;
+            }
+            if (objectType == typeof(String))
+            {
+                return (String)objectJsonData;
+            }
+
+            // For more complex types check for sub type mappings
+            Type deserialization_type = objectType;
+            
+            AddTypeMetadata(deserialization_type);
+            TypeMetadata deserialization_type_meta_data = type_metadata[deserialization_type];
+
+            if (deserialization_type_meta_data.SubtypesMap.Count > 0)
+            {
+                if (objectJsonData.ContainsKey("$type"))
+                {
+                    string elem_sub_type_name = (String)objectJsonData["$type"];
+                            
+                    if (deserialization_type_meta_data.SubtypesMap.ContainsKey(elem_sub_type_name))
+                    {
+                        deserialization_type = deserialization_type_meta_data.SubtypesMap[elem_sub_type_name].Type;
+                    }
+                }   
+            }
+
+            object retObject = null;
+            
+            if (objectJsonData.IsArray)
+            {
+                AddArrayMetadata (deserialization_type);
+                ArrayMetadata t_data = array_metadata[deserialization_type];
+
+                IList list;
+                Type elem_type;
+
+                if (t_data.IsArray == false)
+                {
+                    list = (IList) Activator.CreateInstance(deserialization_type);
+                    elem_type = t_data.ElementType;
+                }
+                else
+                {
+                    list = new ArrayList ();
+                    elem_type = deserialization_type.GetElementType ();
+                }
+                
+                int numElements = objectJsonData.Count;
+                for (int elementIndex = 0; elementIndex < numElements; elementIndex++)
+                {
+                    JsonData elementJsonData = objectJsonData[elementIndex];
+                    
+                    object elementObject = GetObjectFromJsonData(elem_type, elementJsonData);
+
+                    if (elementObject != null)
+                    {
+                        list.Add(elementObject);   
+                    }
+                }
+                
+                if (t_data.IsArray)
+                {
+                    retObject = Array.CreateInstance(elem_type, numElements);
+
+                    for (int i = 0; i < numElements; i++)
+                        ((Array)retObject).SetValue(list[i], i);
+                }
+                else
+                {
+                    retObject = list;
+                }
+            }
+            else if (objectJsonData.IsObject)
+            {
+                retObject = Activator.CreateInstance(deserialization_type);
+                
+                AddObjectMetadata(deserialization_type);
+                ObjectMetadata t_data = object_metadata[deserialization_type];
+                
+                foreach (string propertyName in objectJsonData.Keys)
+                {
+                    JsonData propertyJsonData = objectJsonData[propertyName];
+                
+                    if (t_data.Properties.ContainsKey(propertyName) == false)
+                    {
+                        if (t_data.IsDictionary)
+                        {
+                            object elementObject = GetObjectFromJsonData(t_data.ElementType, propertyJsonData);
+
+                            if (elementObject != null)
+                            {
+                                ((IDictionary)retObject).Add(propertyName, elementObject);   
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    PropertyMetadata prop_data = t_data.Properties[propertyName];
+                    
+                    object propertyObject = GetObjectFromJsonData(prop_data.Type, propertyJsonData);
+
+                    if (propertyObject != null)
+                    {
+                        if (prop_data.IsField)
+                        {
+                            ((FieldInfo)prop_data.Info).SetValue(retObject, propertyObject);
+                        }
+                        else
+                        {
+                            PropertyInfo p_info = (PropertyInfo)prop_data.Info;
+
+                            if (p_info.CanWrite)
+                            {
+                                p_info.SetValue(retObject, propertyObject, null);
+                            }
+                        }   
+                    }
+                }
+            }
+
+            return retObject;
         }
 
         private static IJsonWrapper ReadValue (WrapperFactory factory,
@@ -773,26 +1055,46 @@ namespace LitJson
             }
 
             if (obj is Array) {
+                Array array = obj as Array;
+                Type array_elem_type = array.AsQueryable().ElementType;
+                
+                AddTypeMetadata(array_elem_type);
+                
                 writer.WriteArrayStart ();
-
-                foreach (object elem in (Array) obj)
+                foreach (object elem in array)
                     WriteValue (elem, writer, writer_is_private, depth + 1);
-
                 writer.WriteArrayEnd ();
 
                 return;
             }
 
             if (obj is IList) {
+                IList list = obj as IList;
+                Type listElementType = list.AsQueryable().ElementType;
+
+                AddTypeMetadata(listElementType);
+                
                 writer.WriteArrayStart ();
-                foreach (object elem in (IList) obj)
+                foreach (object elem in list)
                     WriteValue (elem, writer, writer_is_private, depth + 1);
                 writer.WriteArrayEnd ();
 
                 return;
             }
+            
+            Type obj_type = obj.GetType ();
 
-            if (obj is IDictionary dictionary) {
+            AddTypeMetadata(obj_type);
+
+            if (obj is IDictionary dictionary)
+            {
+                Type[] generic_args = obj_type.GetGenericArguments();
+                if (generic_args.Length >= 2)
+                {
+                    Type value_type = generic_args[1];
+                    AddTypeMetadata(value_type);
+                }
+
                 writer.WriteObjectStart ();
                 foreach (DictionaryEntry entry in dictionary) {
                     var propertyName = entry.Key is string key ?
@@ -806,8 +1108,6 @@ namespace LitJson
 
                 return;
             }
-
-            Type obj_type = obj.GetType ();
 
             // See if there's a custom exporter for the object
             if (custom_exporters_table.ContainsKey (obj_type)) {
@@ -855,6 +1155,16 @@ namespace LitJson
             IList<PropertyMetadata> props = type_properties[obj_type];
 
             writer.WriteObjectStart ();
+
+            TypeMetadata metadata = type_metadata[obj_type];
+
+            if (metadata.TypeId != null)
+            {
+                writer.WritePropertyName("$type");
+                
+                WriteValue(metadata.TypeId, writer, writer_is_private, depth + 1);   
+            }
+
             foreach (PropertyMetadata p_data in props) {
                 if (p_data.IsField) {
                     writer.WritePropertyName (p_data.Info.Name);
